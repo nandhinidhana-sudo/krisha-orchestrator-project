@@ -1,7 +1,10 @@
 import time
+import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 
 from src.agents.document_agent import DocumentAgent
-from src.agents.prompts import ORCHESTRATOR_PROMPT, RESPONSE_COMPOSER_PROMPT
+from src.agents.prompts import ORCHESTRATOR_PROMPT, PLANNER_PROMPT, RESPONSE_COMPOSER_PROMPT
 from src.agents.schemas import AgentResponse, RoutePlan
 from src.agents.visualization_agent import VisualizationAgent
 from src.agents.web_agent import WebSearchAgent
@@ -39,29 +42,33 @@ class Orchestrator:
 
             evidence_chunks = []
             evidence_texts = []
+            web_summary = ""
+            artifact_ids = []
             used_agents = ["Orchestrator Agent"]
 
-            if plan.needs_documents:
-                evidence_chunks = self.document_agent.retrieve_evidence(session_id, run_id, user_request)
-                evidence_texts = [chunk.content for chunk in evidence_chunks]
-                used_agents.append(self.document_agent.name)
+            for group in plan.execution_groups or [plan.required_agents]:
+                results = self._run_agent_group(group, session_id, run_id, user_request)
+                if "document_qa" in results:
+                    evidence_chunks = results["document_qa"]
+                    evidence_texts = [chunk.content for chunk in evidence_chunks]
+                    used_agents.append(self.document_agent.name)
+                if "web_search" in results:
+                    web_summary = results["web_search"]
+                    used_agents.append(self.web_agent.name)
+                if "visualization" in group:
+                    used_agents.append(self.visualization_agent.name)
+                    if "mermaid" in plan.visualization_types:
+                        self.visualization_agent.create_mermaid(session_id, run_id, user_request, evidence_texts)
+                        artifact_ids.append("mermaid")
+                    if "vega_lite" in plan.visualization_types:
+                        self.visualization_agent.create_vega_lite(session_id, run_id, user_request, evidence_texts)
+                        artifact_ids.append("vega_lite")
 
-            document_summary = self.document_agent.summarize_evidence(evidence_chunks)
-
-            web_summary = ""
-            if plan.needs_web_search:
-                web_summary = self.web_agent.search(session_id, run_id, user_request)
-                used_agents.append(self.web_agent.name)
-
-            artifact_ids = []
-            if plan.needs_visualization:
-                used_agents.append(self.visualization_agent.name)
-                if "mermaid" in plan.visualization_types:
-                    self.visualization_agent.create_mermaid(session_id, run_id, user_request, evidence_texts)
-                    artifact_ids.append("mermaid")
-                if "vega_lite" in plan.visualization_types:
-                    self.visualization_agent.create_vega_lite(session_id, run_id, user_request, evidence_texts)
-                    artifact_ids.append("vega_lite")
+            document_summary = (
+                self.document_agent.summarize_evidence(evidence_chunks)
+                if plan.needs_documents
+                else "Document QA was not required for this request."
+            )
 
             answer = self.compose_answer(user_request, document_summary, web_summary, artifact_ids)
             duration_ms = int((time.perf_counter() - started) * 1000)
@@ -73,11 +80,88 @@ class Orchestrator:
             raise
 
     def plan(self, user_request: str) -> RoutePlan:
+        if os.getenv("OPENAI_API_KEY"):
+            llm_plan = self._plan_with_llm(user_request)
+            if llm_plan:
+                return llm_plan
+        return self._fallback_plan(user_request)
+
+    def _plan_with_llm(self, user_request: str) -> RoutePlan | None:
+        try:
+            from openai import OpenAI
+
+            client = OpenAI()
+            response = client.chat.completions.create(
+                model=os.getenv("OPENAI_ORCHESTRATOR_MODEL", "gpt-4.1-mini"),
+                messages=[
+                    {"role": "system", "content": PLANNER_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Plan the required specialist agents for this request.\n\n"
+                            f"User request: {user_request}"
+                        ),
+                    },
+                ],
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content or "{}"
+            data = json.loads(raw)
+            plan = RoutePlan.model_validate(data)
+            return self._normalize_plan(plan)
+        except Exception:
+            return None
+
+    def _fallback_plan(self, user_request: str) -> RoutePlan:
         lower = user_request.lower()
-        needs_web = any(
-            word in lower
-            for word in ["latest", "current", "recent", "web", "internet", "market", "news", "competitor"]
-        )
+        document_terms = [
+            "document",
+            "uploaded",
+            "upload",
+            "file",
+            "pdf",
+            "docx",
+            "report",
+            "spreadsheet",
+            "csv",
+            "xlsx",
+            "deck",
+            "attachment",
+            "from the doc",
+            "from the file",
+            "in the report",
+        ]
+        freshness_terms = [
+            "latest",
+            "current",
+            "recent",
+            "today",
+            "now",
+            "live",
+            "real-time",
+            "up to date",
+            "this week",
+            "this month",
+            "2026",
+        ]
+        external_terms = [
+            "web",
+            "internet",
+            "search",
+            "google",
+            "source",
+            "sources",
+            "market",
+            "news",
+            "competitor",
+            "weather",
+            "forecast",
+            "stock",
+            "price",
+            "exchange rate",
+        ]
+        needs_documents = any(term in lower for term in document_terms)
+        needs_web = any(term in lower for term in freshness_terms + external_terms)
         process_terms = [
             "diagram",
             "mermaid",
@@ -118,57 +202,49 @@ class Orchestrator:
             if not visualization_types:
                 visualization_types = ["mermaid", "vega_lite"]
 
+        required_agents = []
+        if needs_documents:
+            required_agents.append("document_qa")
+        if needs_web:
+            required_agents.append("web_search")
+        if needs_visual:
+            required_agents.append("visualization")
+
+        execution_groups = []
+        evidence_group = [agent for agent in required_agents if agent in {"document_qa", "web_search"}]
+        if evidence_group:
+            execution_groups.append(evidence_group)
+        if "visualization" in required_agents:
+            execution_groups.append(["visualization"])
+
         return RoutePlan(
-            needs_documents=True,
+            needs_documents=needs_documents,
             needs_web_search=needs_web,
             needs_visualization=needs_visual,
             visualization_types=visualization_types,
+            required_agents=required_agents,
+            execution_groups=execution_groups,
+            rationale="Fallback heuristic plan used because LLM planning was unavailable.",
         )
 
-    def compose_answer(
-        self,
-        user_request: str,
-        document_summary: str,
-        web_summary: str,
-        artifact_ids: list[str],
-    ) -> str:
-        parts = [
-            "I routed this through the orchestrator and kept the prompt context compact.",
-            "",
-            "**Document evidence**",
-            document_summary,
-        ]
-        if web_summary:
-            parts.extend(["", "**Web research**", web_summary])
-        if artifact_ids:
-            labels = ", ".join(artifact_ids)
-            parts.extend(["", "**Artifacts**", f"Created: {labels}. Open the Artifacts tab to render or inspect them."])
-        parts.extend(
-            [
-                "",
-                "**Context policy**",
-                "The orchestrator used retrieved chunks and summary memory, not the full uploaded document text.",
+    def _normalize_plan(self, plan: RoutePlan) -> RoutePlan:
+        required_agents = list(dict.fromkeys(plan.required_agents))
+        if plan.needs_documents and "document_qa" not in required_agents:
+            required_agents.append("document_qa")
+        if plan.needs_web_search and "web_search" not in required_agents:
+            required_agents.append("web_search")
+        if plan.needs_visualization and "visualization" not in required_agents:
+            required_agents.append("visualization")
+
+        if not plan.execution_groups:
+            evidence_group = [agent for agent in required_agents if agent in {"document_qa", "web_search"}]
+            execution_groups = []
+            if evidence_group:
+                execution_groups.append(evidence_group)
+            if "visualization" in required_agents:
+                execution_groups.append(["visualization"])
+        else:
+            execution_groups = [
+                [agent for agent in group if agent in required_agents]
+                for group in plan.execution_groups
             ]
-        )
-        return "\n".join(parts)
-
-    def compact_memory(self, session_id: str, force: bool = False) -> str:
-        unsummarized = self.db.list_messages(session_id, include_summarized=False)
-        if len(unsummarized) <= self.config.memory_turn_threshold and not force:
-            return ""
-
-        keep = self.config.raw_message_window
-        to_summarize = unsummarized[:-keep] if len(unsummarized) > keep else unsummarized
-        if not to_summarize:
-            return ""
-
-        previous = self.db.latest_summary(session_id)
-        lines = [previous] if previous else []
-        lines.append("Compressed conversation memory:")
-        for message in to_summarize:
-            content = message["content"].replace("\n", " ")
-            lines.append(f"- {message['role']}: {content[:350]}")
-
-        summary = "\n".join(lines)[-6000:]
-        self.db.add_summary(session_id, summary, [message["id"] for message in to_summarize])
-        return "Compacted older conversation turns into session memory."
